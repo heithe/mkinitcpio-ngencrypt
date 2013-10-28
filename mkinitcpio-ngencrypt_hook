@@ -1,0 +1,510 @@
+#!/usr/bin/ash
+
+# author: heithe <heithe01 [at] g m a i l [dot] com>
+# description: rewrite of encrypt hook. supports detached header
+
+# parse (header|key)-parameter
+# in = 1: parameter
+# return = 2: _dev + _arg1 - 3: _dev + _arg1 + _arg2 - 4: _dev + _arg1 + _arg2
+parse_parm() {
+    _dev=; _arg1=; _arg2=
+    echo "${1}" | egrep -q '^rootfs:.*?$'
+    local _rootfs=${?}
+    
+    if [ -z "${1}" ]; then # empty
+        return 1
+    elif echo "${1}" | egrep -q '^rootfs:[^:]*$'; then # inside initcpio + path-name
+        IFS=: read _dev _arg1 <<E
+${1}
+E
+        return 2
+    elif [ ${_rootfs} -gt 0 ] && echo "${1}" | egrep -q '^[^:]*:[0-9]*:[0-9]*$'; then # device + offset + length
+        IFS=: read _dev _arg1 _arg2 <<E
+${1}
+E
+        return 3
+    elif [ ${_rootfs} -gt 0 ] && echo "${1}" | egrep -q '^[^:]*:[^:]*:[^:]*$'; then # device + fs-type + path-name
+        IFS=: read _dev _arg1 _arg2 <<E
+${1}
+E
+        return 4
+    fi
+    return 0
+}
+
+
+# mount + copy file
+# in = 1: device - 2: fs-type 3: tmp-mnt - 4: path-name - 5: output-file
+# return = 0: success - 1: failure
+mount_copy() {
+    echo -n ":: Copying file \"${4}\" from device \"${1}\" (filesystem-type \"${2}\").. "
+    if ! mkdir -p "${3}"; then # tmp mnt folder creation failed
+        echo -e "failed!\n:: Error creating temporary mount folder \"${3}\""
+        return 1
+    fi
+    
+    mount -r -t "${2}" "${1}" "${3}" &>/dev/null
+    case "${?}" in
+        0)    # mount successfully
+            dd if="${3}/${4}" of="${5}" &>/dev/null
+            local _r="${?}"
+            if [ "${_r}" -eq 0 ]; then echo "succeeded"
+            else echo -e "failed!\n:: Error: No File \"${4}\" on device \"${1}\""; fi
+            umount "${3}"
+            return ${_r} ;;
+        32)    echo -e "failed!\n:: Error: Mount failed - verify e.g. given filesystem-type (\"${2}\")" ;;
+        *)    echo -e "failed!\n:: Error: Unknown error while mounting" ;;
+    esac
+    return 1
+}
+
+# copy bytes
+# in = 1: device - 2: offset - 3: length - 4: output-file
+# return = 0: success - 1: failure
+copy_bytes() {
+    echo -n ":: Copying ${3:-?}b starting at offset ${2:-?}b from device \"${1}\".. "
+    dd if="${1}" of="${4}" bs=1 skip="${2}" count="${3}" &>/dev/null
+    if [ "${?}" -eq 0 ]; then echo "succeeded"; return 0
+    else echo -e "failed!\n:: Error: Verify offset \"${2:-?}\" and length \"${3:-?}\""; fi
+    return 1
+}
+
+
+# header menu
+# return = 0: external - 1: internal
+header_menu() {
+    echo -n ":: Menu: 1) set-eheader"; [ "${cdev_is_luks}" -eq 0 ] && echo -n " 2) use-iheader"; echo -n " -> "
+    local _r=
+    while read -sn1 _r; do
+        case ${_r} in
+            1)    echo "1)"; # external header
+                local _rf= _ch=
+                while :; do
+                    if [ -n "${_ch:-${cryptheader}}" ]; then read -p ":: Enter cryptheader (${_ch:-${cryptheader}}): " _ch
+                    else read -p ":: Enter cryptheader: " _ch; fi
+                    if [ "${_ch}" = "?" ]; then # help
+                        echo ":: format:  rootfs:<path-name> (path inside initcpio) -> e.g. rootfs:/header.bin"
+                        echo "::          <device>:<offset>:<length> -> e.g. /dev/sda:512:1024"
+                        echo "::          <device>:<filesystem-type>:<path-name> -> e.g. /dev/sdb:ext2:/luks/header"
+                        _ch=; continue
+                    fi
+                    parse_parm ${_ch}
+                    _rf=${?}
+                    if [ "${cdev_is_luks}" -eq 0 ] && [ "${_rf}" -eq 1 ]; then # empty + valid internal header
+                        echo ":: Empty cryptheader-parameter given - using internal"
+                        return 1
+                    elif [ "${_rf}" -gt 1 ]; then
+                        cryptheader=${_ch}
+                        return 0
+                    fi
+                    echo ":: Malformed cryptheader-parameter - try again (need help? type ? and press enter)"
+                done ;;
+            2)    if [ "${cdev_is_luks}" -eq 0 ]; then echo "2)"; return 1; fi ;; # internal header
+        esac
+    done
+}
+
+# internal header
+# return = 0: success - 1: failure
+internal_header() {
+    if [ "${cdev_is_luks}" -eq 0 ]; then # valid internal header
+        echo ":: Internal header is valid"
+        return 0
+    else # invalid internal header
+        echo ":: Error: No valid internal header"
+        return 1
+    fi
+}
+
+# external header
+# return = 0: success / valid luks header - 1: failure / invalid luks header
+external_header() {
+    if [ -n "${cryptheader}" ]; then # parm given
+        echo ":: Given cryptheader-parameter: \"${cryptheader}\""
+        parse_parm "${cryptheader}"
+        local _rf=${?}
+        
+        if [ "${_rf}" -eq 2 ]; then # inside initcpio - rootfs + path-name
+            echo -n ":: Using external header \"${_arg1}\" stored inside of initcpio.. "
+            if [ ! -e "/${_arg1}" ]; then # file does not exist
+                echo -e "failed!\n:: Error: File \"${_arg1}\" not found inside of initcpio"
+                return 1
+            fi
+            echo "succeeded"
+            cheader_file=${_arg1}
+            
+        elif [ "${_rf}" -gt 1 ]; then # valid format
+            if resolved=$(resolve_device "${_dev}" ${rootdelay}); then # device accessible
+                rm -f ${cheader_file}
+                local _cr=
+                if [ "${_rf}" -eq 3 ]; then # device + offset + length
+                    copy_bytes ${resolved} ${_arg1} ${_arg2} ${cheader_file}
+                    _cr=${?}
+                    
+                elif [ "${_rf}" -eq 4 ]; then # device + fs-type + path-name
+                    mount_copy ${resolved} ${_arg1} "${cheader_mnt:-/cheader}" ${_arg2} ${cheader_file}
+                    _cr=${?}
+                fi
+                if [ "${_cr}" -gt 0 ]; then return 1; fi # file copy error
+                
+            else # device not accessible
+                echo ":: External header device not accessible: \"${_dev}\""
+                return 1
+            fi
+            
+        else # invalid format
+            echo ":: Error: Malformed cryptheader-parameter"
+            return 1
+        fi
+        
+        if [ -f "${cheader_file}" ]; then # file copy successful
+            if cryptsetup isLuks "${cheader_file}"; then # valid luks header
+                echo ":: Given external header is valid"
+                exe="${exe} --header '${cheader_file}'"
+                return 0
+                
+            else # no valid luks header
+                echo ":: Error: Invalid external header given"
+                return 1
+            fi
+            
+        else # file copy failed
+            echo ":: Error: External header device seems accessible but file copy failed"
+            return 1
+        fi
+        
+    else # parm not given
+        echo ":: No cryptheader-parameter given"
+        return 1
+    fi
+}
+
+# header
+# return = 0: success - 1: failure
+# flow-key-chars:
+#   i = internal
+#   e = external
+#   m = menu | M = infinite repeat menu
+header() {    
+    local _flow="${default_hflow:-ieM}"
+    if [ -n "${hflow}" ] && echo "${hflow}" | egrep -q '^(e|ei|i|ie)?m*M?$'; then _flow=${hflow}; echo "GOT OWN FLOW"; fi
+    echo ":: 1. Get header - using flow: \"${_flow}\""
+    local _i=-1 _li=$((${#_flow}-1)); local _flow_last=${_flow:${_li}:1}
+    
+    while :; do
+        _i=$((_i+1))
+        if [ ${_i} -gt ${_li} ]; then
+            case "${_flow_last}" in
+                M)    _i=${_li} ;; # infinite repeat
+                *)    return 1 ;; # fatal end
+            esac
+        fi
+        
+        echo -n ":: Next flow-step: "
+        case "${_flow:${_i}:1}" in
+            m|M)    echo "[m] -> menu" # menu
+                    if header_menu; then if external_header; then return 0; fi
+                    else if internal_header; then return 0; fi; fi
+                    continue ;;
+                    
+            i)        echo "[i] -> internal header" # internal
+                    if internal_header; then return 0; fi
+                    continue ;;
+                    
+            e)        echo "[e] -> external header" # external
+                    if external_header; then return 0; fi
+                    continue ;;
+        esac
+    done
+}
+
+
+# key menu
+# return = 0: key - 1: pass
+key_menu() {
+    echo -n ":: Menu: 1) set-key 2) use-passphrase -> "
+    local _r=
+    while read -sn1 _r; do
+        case ${_r} in
+            1)    echo "1)";
+                local _ck= _try=0
+                while :; do
+                    if [ -n "${_ck:-${cryptkey}}" ]; then read -p ":: Enter cryptkey (${_ck:-${cryptkey}}): " _ck
+                    else read -p ":: Enter cryptkey: " _ck; fi
+                    _try=$((_try+1))
+                    if [ "${_ck}" = "?" ]; then # help
+                        echo ":: format:  rootfs:<path-name> (path inside initcpio) -> e.g. rootfs:/key.bin"
+                        echo "::          <device>:<offset>:<length> -> e.g. /dev/sda:512:1024"
+                        echo "::          <device>:<filesystem-type>:<path-name> -> e.g. /dev/sdb:ext2:/luks/key"
+                        _ck=; continue
+                    fi
+                    parse_parm ${_ck}
+                    if [ "${?}" -gt 1 ] || [ "${_try}" -gt 1 ]; then
+                        cryptkey=${_ck}
+                        return 0
+                    fi
+                    echo ":: Invalid cryptkey format - try again (need help? type ? and press enter)"
+                done ;;
+            2)    echo "2)"; return 1 ;;
+        esac
+    done
+}
+
+# key unlock
+# return = 0: success - 1: failure
+key_unlock() {
+    if [ -n "${cryptkey}" ]; then # parm given
+        echo ":: Given cryptkey-parameter: \"${cryptkey}\""
+        parse_parm "${cryptkey}"
+        local _rf=${?}
+        
+        if [ "${_rf}" -eq 2 ]; then # inside initcpio - rootfs + path-name
+            echo -n ":: Using key file \"${_arg1}\" stored inside of initcpio.. "
+            if [ ! -e "/${_arg1}" ]; then # file does not exist
+                echo -e "failed!\n:: Error: File \"${_arg1}\" not found inside of initcpio"
+                return 1
+            fi
+            echo "succeeded"
+            ckey_file=${_arg1}
+            
+        elif [ "${_rf}" -gt 1 ]; then # valid format
+            if resolved=$(resolve_device "${_dev}" ${rootdelay}); then # device accessible
+                rm -f ${ckey_file}
+                local _cr=
+                if [ "${_rf}" -eq 3 ]; then # device + offset + length
+                    copy_bytes ${resolved} ${_arg1} ${_arg2} ${ckey_file}
+                    _cr=${?}
+                    
+                elif [ "${_rf}" -eq 4 ]; then # device + fs-type + path-name
+                    mount_copy ${resolved} ${_arg1} "${ckey_mnt:-/ckey}" ${_arg2} ${ckey_file}
+                    _cr=${?}
+                fi
+                if [ "${_cr}" -gt 0 ]; then return 1; fi # file copy error
+                
+            else # device not accessible
+                echo ":: Key device not accessible: \"${_dev}\""
+                return 1
+            fi
+            
+        else # invalid format
+            echo ":: Error: Malformed cryptkey-parameter"
+            return 1
+        fi
+        
+        if [ -f "${ckey_file}" ]; then # file copy successful
+            echo -n ":: Unlocking with given key file.. "
+            eval "${exe} --key-file '${ckey_file}' &>/dev/null" # try unlocking with key file
+            case "${?}" in
+                0)    echo "succeeded"; return 0 ;; # success
+                2)    echo -e "failed!\n:: Invalid key file given" ;; # no permission / bad key file
+                *)    echo -e "failed!\n:: Error: Unknown error while unlocking with key" ;;
+            esac
+            return 1
+            
+        else # file copy failed
+            echo ":: Error: Key device seems accessible but file copy failed"
+            return 1
+        fi
+        
+    else # parm not given
+        echo ":: No cryptkey-parameter given"
+        return 1
+    fi
+}
+
+# pass unlock
+# return = 0: success - 1: failure
+pass_unlock() {
+    echo -n ":: Enter passphrase for \"${cdev}\": "
+    eval "${exe} --tries 1 &>/dev/null"
+    case "${?}" in # handle return code
+        0)    echo -e "success\n:: Valid passphrase entered"; return 0 ;; # unlock success
+        2)    echo -e "failed!\n:: Error: Invalid passphrase entered" ;; # no permission / bad passphrase
+        *)    echo -e "failed!\n:: Error: Unknown error while unlocking with passphrase" ;;
+    esac
+    return 1
+}
+
+# unlock
+# return = 0: success - 1: failure
+# flow key-chars:
+#   k = key
+#   p = pass | P = infinite repeat pass
+#   f = fake pass | F = infinite repeat fake pass
+#   m = menu | M = infinite repeat menu
+unlock() {
+    local _flow="${default_uflow:-kM}"
+    if [ -n "${uflow}" ] && echo "${uflow}" | egrep -q '^k?[fp]*([FP]?|m*[M]?)?$'; then _flow=${uflow}; fi
+    echo ":: 2. Unlock - using flow: \"${_flow}\""
+    local _i=-1 _li=$((${#_flow}-1)); local _flow_last=${_flow:${_li}:1}
+    
+    while :; do
+        _i=$((_i+1))
+        if [ ${_i} -gt ${_li} ]; then # check last flow entry
+            case "${_flow_last}" in
+                M|P|F)    _i=${_li} ;; # infinite repeat
+                    *)    return 1 ;;
+            esac
+        fi
+        
+        echo -n ":: Next flow-step: "
+        case "${_flow:${_i}:1}" in
+              k)    echo "[k] -> key file" # key
+                    if key_unlock; then return 0; fi
+                    continue ;;
+                    
+            m|M)    echo "[m] -> menu" # menu
+                    if key_menu; then if key_unlock; then return 0; fi
+                    else if pass_unlock; then return 0; fi; fi
+                    continue ;;
+                    
+            p|P)    echo "[p] -> passphrase" # pass
+                    if pass_unlock; then return 0; fi
+                    continue ;;
+                    
+            #f|F)    echo "[f] -> fake passphrase" # fake pass - do not show that to "attacker" ..
+            f|F)    echo "[p] -> passphrase"
+                    read -sp "${fpa_qtext:-:: Enter passphrase for device \"${cdev}\": }" cfp; cfp=; echo
+                    [[ "${fpa_sleep:-0}" -gt 0 ]] && sleep ${qfake_sleep}
+                    echo "${fpa_atext:-:: Invalid passphrase given - try again}"
+                    continue ;;
+        esac
+    done
+}
+
+
+# device menu
+# return = 0: set device - 1: exit
+device_menu() {
+    echo -n ":: Menu: 1) set-device 2) exit -> "
+    local _r=
+    while read -sn1 _r; do
+        case ${_r} in
+            1)    echo "1)"; 
+                local _cd=
+                while :; do
+                    if [ -n "${_cd:-${cryptdevice}}" ]; then read -p ":: Enter cryptdevice (${_cd:-${cryptdevice}}): " _cd
+                    else read -p ":: Enter cryptdevice: " _cd; fi
+                    if [ "${_cd}" = "?" ]; then # help
+                        echo ":: format:  <device>:<name>:<options> -> e.g. /dev/sda:luks_main"
+                        echo "::                                       e.g. /dev/sdb1:luks:allow-discards"
+                        _cd=; continue
+                    fi
+                    if echo "${_cd}" | egrep -q '^[^:]*:[^:]*(:[^:]*)?$'; then
+                        cryptdevice=${_cd}
+                        return 0
+                    fi
+                    echo ":: Malformed cryptdevice-parameter - try again (need help? type ? and press enter)"
+                done ;;
+            2)    echo "2)"; return 1 ;;
+        esac
+    done
+}
+
+
+
+# main
+run_hook() {
+    
+    ## defaults >>
+    local default_hflow="ieM" default_uflow="kM" # default flows
+    local fpa_sleep="0.5" fpa_qtext=":: Enter passphrase for device \"${cdev}\": " fpa_atext=":: Invalid passphrase given - try again" # fake pass text + sleep
+    local cheader_mnt="/cheader" ckey_mnt="/ckey" # tmp mnt folders
+    local cheader_file="/crypto_headerfile.bin" ckey_file="/crypto_keyfile.bin" # tmp files
+    rootdelay=1
+    ## defaults <<
+    
+    modprobe -a -q dm-crypt &>/dev/null # load module
+    
+    while :; do
+        if echo "${cryptdevice}" | egrep -q '^[^:]*:[^:]*(:[^:]*)?$'; then # valid cryptdevice format
+            echo ":: Given cryptdevice: \"${cryptdevice}\""
+            IFS=: read cdev cname copts <<E
+${cryptdevice}
+E
+            
+            for _co in ${copts//,/ }; do # parse cryptoptions
+                case "${_co}" in
+                    allow-discards)        cargs="${cargs} --allow-discards" ;;
+                                 *)        echo ":: Notice: Skipped unknown option: \"${_co}\"" ;;
+                esac
+            done
+            
+            if echo "${cryptflow}" | egrep -q '^[^:]*:[^:]*$'; then # parse cryptflow - valid 2 fields
+                IFS=: read hflow uflow <<E
+${cryptflow}
+E
+            fi
+            
+            if resolved=$(resolve_device "${cdev}" ${rootdelay}); then # resolve cdev
+                cryptsetup isLuks "${cdev}" # is luks
+                cdev_is_luks="${?:-1}"
+                
+                if [ -n "${cryptheader}" ] || [ "${cdev_is_luks}" -eq 0 ] || echo "${hflow}" | grep -q '[em]'; then # luks
+                    echo ":: Encryption type: LUKS"
+                    exe="cryptsetup open --type luks ${resolved} ${cname} ${cargs}"
+                    
+                    if header; then # valid internal or external header
+                        if ! unlock; then # unlock failed
+                            echo "FATAL END - NO UNLOCK"
+                            return 1
+                        fi
+                        
+                    else # no valid header
+                        echo "FATAL END - NO HEADER, NO UNLOCK"
+                        return 1
+                    fi
+                    
+                elif [ -n "${crypto}" ]; then # plain
+                    echo "Encryption type: plain"
+                    exe="cryptsetup open --type plain ${cdev} ${cname} ${cargs}"
+                    
+                    if echo "${crypto}" | egrep -q '^[^:]*:[^:]*:([0-9]*(:[0-9]*(:[^:]*)?)?)?$'; then # valid
+                        IFS=: read chash ccipher ckeysize coffset cskip <<E
+${crypto}
+E
+                        
+                        [ -n "${chash}" ] && exe="${exe} --hash '${chash}'"
+                        [ -n "${ccipher}" ] && exe="${exe} --cipher '${ccipher}'"
+                        [ -n "${ckeysize}" ] && exe="${exe} --key-size '${ckeysize}'"
+                        [ -n "${coffset}" ] && exe="${exe} --offset '${coffset}'"
+                        [ -n "${cskip}" ] && exe="${exe} --skip '${cskip}'"
+                        
+                        echo "exe: $exe"
+                        if ! unlock; then # unlock failed - possible if no check is made?
+                            echo ":: Error: ?"
+                            return 1
+                        fi
+                        
+                    else # invalid
+                        echo ":: Error: Invalid crypto-parameter (Format: crypto=<hash>:<cipher>:<keysize>:<offset>:<skip>)"
+                        return 1
+                    fi
+                    
+                else # no idea what encryption it is - error
+                    echo ":: Error: No plain or LUKS encryption - what is it?"
+                    exit 1
+                fi
+                
+                
+                # unlock succeeded - check mapping device
+                if [ -e "/dev/mapper/${cname}" ]; then # mapping succeeded
+                    echo ":: Device ${cdev} unlocked and mapped to /dev/mapper/${cname}"
+                    return 0
+                    
+                else # mapping failed
+                    echo ":: Error: Unlock succeeded but mapping to $cname failed"
+                    exit 1
+                fi
+                
+            else # device not accessible
+                echo ":: Error: Encrypted device \"${cdev}\" not accessible"
+                if ! device_menu; then exit 1; fi
+            fi
+            
+        else # invalid cryptdevice format
+            echo ":: Error: Malformed cryptdevice-parameter given"
+            if ! device_menu; then exit 1; fi
+        fi
+    done
+}

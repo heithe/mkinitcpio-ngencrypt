@@ -1,0 +1,17 @@
+post_install() {
+    cat <<E
+To use this mkinitcpio hook add ngencrypt to the mkinitcpio hooks in /etc/mkinitcpio.conf and regenerate the initcpio. After that add cryptdevice=<device>:<mapping-name> to your kernel boot command line. Additionaly you can add the parameters cryptheader, cryptkey and cryptflow. Please have a look at the README.
+E
+}
+
+post_upgrade() {
+    cat <<E
+To use this mkinitcpio hook add ngencrypt to the mkinitcpio hooks in /etc/mkinitcpio.conf and regenerate the initcpio. After that add cryptdevice=<device>:<mapping-name> to your kernel boot command line. Additionaly you can add the parameters cryptheader, cryptkey and cryptflow. Please have a look at the README.
+E
+}
+
+post_remove() {
+    cat <<E
+Remove the ngencrypt entry from your mkinitcpio hook line in /etc/mkinitcpio.conf if you added it.
+E
+}
